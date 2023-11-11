@@ -507,11 +507,21 @@ function spawnDlvDapServerProcess(
 	// by combining process.env.
 	const envForSpawn = env ? Object.assign({}, process.env, env) : undefined;
 
+	dlvArgs.unshift(dlvPath);
+
 	dlvArgs.push(`--listen=${host}:${port}`);
 
 	const onWindows = process.platform === 'win32';
+	const asRoot = launchAttachArgs.asRoot === true;
 
-	if (!onWindows) {
+	// When running with asRoot we need to spawn the debug server as a child of sudo.
+	// Sudo only works with the most common 3 unix streams. When adding a forth (index 3)
+	// its output will not be reaching us, hence we skip this step when running as root.
+	// a side effect is that asRoot is not compatible with logDest, for which we log an error.
+	// This could be changed in the future by using named pipes instead of a unix stream,
+	// but that would require possibly some book keeping to make sure the named pipe is
+	// removed once finished. 
+	if (!onWindows && !asRoot) {
 		dlvArgs.push('--log-dest=3');
 	}
 
@@ -532,20 +542,37 @@ function spawnDlvDapServerProcess(
 		);
 		throw new Error('Using `logDest` on windows is not allowed');
 	}
+	if (logDest && asRoot) {
+		logErr(
+			'Using `logDest` or `--log-dest` is incompatible with running `asRoot`'
+		);
+		throw new Error('Using `logDest` when running as root is not allowed');
+	}
 
 	const logDestStream = logDest ? fs.createWriteStream(logDest) : undefined;
 
-	logConsole(`Starting: ${dlvPath} ${dlvArgs.join(' ')} from ${dir}\n`);
+	if (launchAttachArgs.asRoot === true && !onWindows) {
+		const sudo = getSudo();
+		if (sudo) {
+			dlvArgs.unshift(sudo);
+			dlvArgs.push("--only-same-user=false");
+		} else {
+			throw new Error('Failed to find "sudo" utility');
+		}
+	}
+
+	const cmd = dlvArgs.shift(); // first argument is the command to run
+	logConsole(`Starting: ${cmd} ${dlvArgs.join(' ')} from ${dir}\n`);
 
 	// TODO(hyangah): In module-module workspace mode, the program should be build in the super module directory
 	// where go.work (gopls.mod) file is present. Where dlv runs determines the build directory currently. Two options:
 	//  1) launch dlv in the super-module module directory and adjust launchArgs.cwd (--wd).
 	//  2) introduce a new buildDir launch attribute.
 	return new Promise<ChildProcess>((resolve, reject) => {
-		const p = spawn(dlvPath, dlvArgs, {
+		const p = spawn(cmd, dlvArgs, {
 			cwd: dir,
 			env: envForSpawn,
-			stdio: onWindows ? ['pipe', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe', 'pipe'] // --log-dest=3 if !onWindows.
+			stdio: onWindows || asRoot ? ['pipe', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe', 'pipe'] // --log-dest=3 if !onWindows.
 		});
 		let started = false;
 		const timeoutToken: NodeJS.Timer = setTimeout(() => {
